@@ -3,9 +3,16 @@ from datetime import datetime, timedelta
 import csv
 import os
 from functools import wraps
+from github import Github, InputGitAuthor
+import time
 
 app = Flask(__name__)
 app.secret_key = 'habitualize-secret-key-change-this-in-production'
+
+# GitHub Configuration
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+GITHUB_REPO = os.environ.get('GITHUB_REPO')  # Format: "username/repo-name"
+GITHUB_BRANCH = os.environ.get('GITHUB_BRANCH', 'main')
 
 # CSV Files
 HABITS_FILE = 'habits.csv'
@@ -13,26 +20,97 @@ COMPLETED_FILE = 'completed.csv'
 PROGRESS_LOG_FILE = 'progress_log.csv'
 GOALS_FILE = 'goals.csv'
 
+# Initialize GitHub
+github_client = None
+github_repo = None
+
+if GITHUB_TOKEN and GITHUB_REPO:
+    try:
+        github_client = Github(GITHUB_TOKEN)
+        github_repo = github_client.get_repo(GITHUB_REPO)
+        print(f"✅ Connected to GitHub repo: {GITHUB_REPO}")
+    except Exception as e:
+        print(f"⚠️ GitHub connection failed: {e}")
+
+# GitHub Sync Functions
+def sync_file_from_github(file_path):
+    """Download file from GitHub to local filesystem"""
+    if not github_repo:
+        return False
+    
+    try:
+        contents = github_repo.get_contents(file_path, ref=GITHUB_BRANCH)
+        with open(file_path, 'wb') as f:
+            f.write(contents.decoded_content)
+        print(f"✅ Downloaded {file_path} from GitHub")
+        return True
+    except Exception as e:
+        print(f"⚠️ Could not download {file_path}: {e}")
+        return False
+
+def sync_file_to_github(file_path, commit_message="Update data"):
+    """Upload file from local filesystem to GitHub"""
+    if not github_repo:
+        print("⚠️ GitHub not configured")
+        return False
+    
+    try:
+        # Read local file
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Check if file exists in GitHub
+        try:
+            file_contents = github_repo.get_contents(file_path, ref=GITHUB_BRANCH)
+            # File exists - update it
+            github_repo.update_file(
+                file_path,
+                commit_message,
+                content,
+                file_contents.sha,
+                branch=GITHUB_BRANCH
+            )
+            print(f"✅ Updated {file_path} in GitHub")
+        except:
+            # File doesn't exist - create it
+            github_repo.create_file(
+                file_path,
+                commit_message,
+                content,
+                branch=GITHUB_BRANCH
+            )
+            print(f"✅ Created {file_path} in GitHub")
+        
+        return True
+    except Exception as e:
+        print(f"❌ Failed to sync {file_path} to GitHub: {e}")
+        return False
+
 # Initialize CSV files
 def init_files():
-    if not os.path.exists(HABITS_FILE):
-        with open(HABITS_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(['name', 'points', 'archived', 'creation_date'])
+    """Initialize CSV files - download from GitHub or create new"""
+    files = {
+        HABITS_FILE: ['name', 'points', 'archived', 'creation_date'],
+        COMPLETED_FILE: ['date', 'name'],
+        PROGRESS_LOG_FILE: ['date', 'earned_points', 'possible_points'],
+        GOALS_FILE: ['name', 'status', 'deadline', 'points']
+    }
     
-    if not os.path.exists(COMPLETED_FILE):
-        with open(COMPLETED_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(['date', 'name'])
-    
-    if not os.path.exists(PROGRESS_LOG_FILE):
-        with open(PROGRESS_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(['date', 'earned_points', 'possible_points'])
-    
-    if not os.path.exists(GOALS_FILE):
-        with open(GOALS_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(['name', 'status', 'deadline', 'points'])
+    for file_path, headers in files.items():
+        # Try to download from GitHub first
+        if not sync_file_from_github(file_path):
+            # If not in GitHub, create locally
+            if not os.path.exists(file_path):
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerow(headers)
+                print(f"✅ Created {file_path} locally")
+                # Upload to GitHub
+                sync_file_to_github(file_path, f"Initialize {file_path}")
 
-# Data Access Functions
+# Data Access Functions (Modified to sync with GitHub)
 def get_all_habits(archived=None):
+    sync_file_from_github(HABITS_FILE)  # Always get latest from GitHub
+    
     if not os.path.exists(HABITS_FILE):
         return []
     
@@ -45,6 +123,8 @@ def get_all_habits(archived=None):
     return [h for h in habits if (h.get('archived', 'False') == 'True') == archived]
 
 def get_all_goals():
+    sync_file_from_github(GOALS_FILE)
+    
     if not os.path.exists(GOALS_FILE):
         return []
     
@@ -52,6 +132,8 @@ def get_all_goals():
         return list(csv.DictReader(f))
 
 def get_completed_for_date(date_str):
+    sync_file_from_github(COMPLETED_FILE)
+    
     if not os.path.exists(COMPLETED_FILE):
         return set()
     
@@ -66,11 +148,13 @@ def add_habit(name, points):
     creation_date = datetime.now().strftime('%Y-%m-%d')
     with open(HABITS_FILE, 'a', newline='', encoding='utf-8') as f:
         csv.writer(f).writerow([name, points, 'False', creation_date])
+    
+    # Sync to GitHub
+    sync_file_to_github(HABITS_FILE, f"Add habit: {name}")
 
 def update_habit(old_name, new_name, new_points):
     habits = get_all_habits()
     
-    # Check for duplicate names
     if old_name.lower() != new_name.lower():
         if any(h['name'].lower() == new_name.lower() for h in habits):
             return False
@@ -86,6 +170,8 @@ def update_habit(old_name, new_name, new_points):
         writer.writeheader()
         writer.writerows(habits)
     
+    # Sync to GitHub
+    sync_file_to_github(HABITS_FILE, f"Update habit: {old_name} → {new_name}")
     return True
 
 def set_habit_archived(name, is_archived):
@@ -100,6 +186,10 @@ def set_habit_archived(name, is_archived):
         writer = csv.DictWriter(f, fieldnames=['name', 'points', 'archived', 'creation_date'])
         writer.writeheader()
         writer.writerows(habits)
+    
+    # Sync to GitHub
+    action = "Archive" if is_archived else "Unarchive"
+    sync_file_to_github(HABITS_FILE, f"{action} habit: {name}")
 
 def delete_habit(name):
     habits = [h for h in get_all_habits() if h['name'] != name]
@@ -118,6 +208,11 @@ def delete_habit(name):
             writer = csv.DictWriter(f, fieldnames=['date', 'name'])
             writer.writeheader()
             writer.writerows(records)
+        
+        sync_file_to_github(COMPLETED_FILE, f"Remove completed records for: {name}")
+    
+    # Sync to GitHub
+    sync_file_to_github(HABITS_FILE, f"Delete habit: {name}")
 
 def toggle_completion(habit_name, is_completed, date_str=None):
     if date_str is None:
@@ -136,10 +231,17 @@ def toggle_completion(habit_name, is_completed, date_str=None):
         writer = csv.DictWriter(f, fieldnames=['date', 'name'])
         writer.writeheader()
         writer.writerows(records)
+    
+    # Sync to GitHub
+    action = "Complete" if is_completed else "Uncomplete"
+    sync_file_to_github(COMPLETED_FILE, f"{action} habit: {habit_name} on {date_str}")
 
 def add_goal(name, status, deadline, points):
     with open(GOALS_FILE, 'a', newline='', encoding='utf-8') as f:
         csv.writer(f).writerow([name, status, deadline, points])
+    
+    # Sync to GitHub
+    sync_file_to_github(GOALS_FILE, f"Add goal: {name}")
 
 def update_goal(old_name, new_name, new_status, new_deadline, new_points):
     goals = get_all_goals()
@@ -161,6 +263,8 @@ def update_goal(old_name, new_name, new_status, new_deadline, new_points):
         writer.writeheader()
         writer.writerows(goals)
     
+    # Sync to GitHub
+    sync_file_to_github(GOALS_FILE, f"Update goal: {old_name} → {new_name}")
     return True
 
 def delete_goal(name):
@@ -170,6 +274,9 @@ def delete_goal(name):
         writer = csv.DictWriter(f, fieldnames=['name', 'status', 'deadline', 'points'])
         writer.writeheader()
         writer.writerows(goals)
+    
+    # Sync to GitHub
+    sync_file_to_github(GOALS_FILE, f"Delete goal: {name}")
 
 def get_weekly_streak(habit_name):
     today = datetime.now()
@@ -189,6 +296,8 @@ def get_weekly_streak(habit_name):
     return streak
 
 def save_progress_snapshot(date_str, earned, possible):
+    sync_file_from_github(PROGRESS_LOG_FILE)
+    
     records = []
     found = False
     
@@ -212,8 +321,13 @@ def save_progress_snapshot(date_str, earned, possible):
         writer = csv.DictWriter(f, fieldnames=['date', 'earned_points', 'possible_points'])
         writer.writeheader()
         writer.writerows(records)
+    
+    # Sync to GitHub
+    sync_file_to_github(PROGRESS_LOG_FILE, f"Update progress for {date_str}")
 
 def get_progress_snapshot(date_str):
+    sync_file_from_github(PROGRESS_LOG_FILE)
+    
     if not os.path.exists(PROGRESS_LOG_FILE):
         return None
     
@@ -223,7 +337,7 @@ def get_progress_snapshot(date_str):
                 return row
     return None
 
-# Routes
+# Routes (keep all your existing routes from before)
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -253,7 +367,6 @@ def api_daily_overview():
             'creation_date': habit.get('creation_date', '')
         })
     
-    # Save today's progress
     save_progress_snapshot(today_str, earned_points, total_points)
     
     return jsonify({
@@ -281,7 +394,6 @@ def api_add_habit():
     if not name:
         return jsonify({'error': 'Name required'}), 400
     
-    # Check for duplicates
     if any(h['name'].lower() == name.lower() for h in get_all_habits()):
         return jsonify({'error': 'Habit already exists'}), 400
     
@@ -408,7 +520,6 @@ def api_delete_goal():
 
 @app.route('/api/progress/<date_str>', methods=['GET'])
 def api_progress_for_date(date_str):
-    # Get habits that existed on that date
     habits = get_all_habits(archived=False)
     completed = get_completed_for_date(date_str)
     
@@ -432,7 +543,6 @@ def api_progress_for_date(date_str):
         else:
             pending_habits.append(habit_data)
     
-    # Get weekly summary
     weekly_earned = 0
     weekly_possible = 0
     
@@ -467,7 +577,6 @@ def api_toggle_progress():
     
     toggle_completion(habit_name, is_completed, date_str)
     
-    # Recalculate and save progress for that date
     habits = get_all_habits(archived=False)
     completed = get_completed_for_date(date_str)
     
